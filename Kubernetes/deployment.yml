@@ -16,6 +16,6 @@ spec:
     spec:
       containers:
       - name: netflix-app
-        image: jenny9/netflix-ott:7
+        image: jenny9/netflix-ott:8
         ports:
         - containerPort: 80
