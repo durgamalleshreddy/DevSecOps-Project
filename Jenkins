@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'  // Ensure JDK 17 is available for your pipeline
+        nodejs 'node16'  // Ensure Node.js 16 is available for your pipeline
+    }
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'  // Specify the path to SonarQube scanner
+        ARGOCD_SERVER = '192.168.34.244:31847'  // Replace with your Argo CD server URL
+        ARGOCD_APP_NAME = 'netflix-app'  // Replace with your Argo CD application name
+        ARGOCD_PROJECT_NAME = 'default'  // Optional: Replace with your Argo CD project name
+        GIT_REPO_URL = 'git@github.com:durgamalleshreddy/DevSecOps-Project.git'  // Git repository URL for Kubernetes manifests
+        GIT_REPO_URL_HTTP = 'https://github.com/durgamalleshreddy/DevSecOps-Project.git'
+        DOCKER_IMAGE_TAG = "jenny9/netflix-ott:${BUILD_NUMBER}"  // Dynamically use the build number for the image tag
+    }
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()  // Clean up workspace before starting
+            }
+        }
+        stage('Checkout from Git') {
+            steps {
+                git branch: 'main', url: GIT_REPO_URL  // Checkout your Git repository with Kubernetes manifests
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {  // Ensure 'sonar-server' is defined in Jenkins Global configuration
+                    sh '''
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=Netflix \
+                    -Dsonar.projectKey=Netflix \
+                    -Dsonar.sources=.
+                    '''
+                }
+            }
+        }
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: true  // Wait for quality gate status and abort if failed
+                }
+            }
+        }
+        stage('Install Dependencies') {
+            steps {
+                sh "npm install"  // Install Node.js dependencies
+            }
+        }
+        stage('Trivy FS Scan') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"  // Scan the filesystem for vulnerabilities with Trivy
+            }
+        }
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry([credentialsId: 'docker', url: 'https://index.docker.io/v1/']) {
+                        sh '''
+                        docker build --build-arg TMDB_V3_API_KEY=8ebef842cbcf42f57d7014a4807b5495 -t ${DOCKER_IMAGE_TAG} . 
+                        docker push ${DOCKER_IMAGE_TAG}
+                        '''
+                    }
+                }
+            }
+        }
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image ${DOCKER_IMAGE_TAG} > trivyimage.txt"  // Scan the Docker image for vulnerabilities with Trivy
+            }
+        }
+        stage('Update Kubernetes Manifests with New Image') {
+            steps {
+                script {
+                    // Update the image tag in the Kubernetes deployment YAML (e.g., deployment.yaml)
+                    sh """
+                    sed -i 's|image: jenny9/netflix-ott:.*|image: ${DOCKER_IMAGE_TAG}|g' ./Kubernetes/deployment.yml
+                    # Commit the changes to Git
+                    git config --global user.name "durgamalleshreddy"
+                    git config --global user.email "durgamalleshreddy@gmail.com"
+                    git add ./Kubernetes/deployment.yml
+                    git commit -m "Updated Docker image tag to ${DOCKER_IMAGE_TAG}"
+                    git push -u origin main
+
+                    """
+                }
+            }
+        }
+        stage('Argo CD Repository and App Setup') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'Argocd', usernameVariable: 'ARGOCD_USERNAME', passwordVariable: 'ARGOCD_PASSWORD'),string(credentialsId: 'jenkins', variable: 'GIT_TOKEN')]) {
+                    script {
+                        // Login to Argo CD
+                        sh '''
+                        argocd login $ARGOCD_SERVER --username $ARGOCD_USERNAME --password $ARGOCD_PASSWORD --insecure
+                        argocd repo add $GIT_REPO_URL_HTTP --username durgamalleshreddy --password $GIT_TOKEN --insecure-skip-server-verification
+
+                        argocd app create $ARGOCD_APP_NAME \
+                            --repo $GIT_REPO_URL_HTTP \
+                            --path Kubernetes \
+                            --dest-server https://kubernetes.default.svc \
+                            --dest-namespace default || \
+                        argocd app set $ARGOCD_APP_NAME --repo $GIT_REPO_URL_HTTP --path kubernetes --dest-server https://kubernetes.default.svc --dest-namespace default
+                        argocd app sync $ARGOCD_APP_NAME --prune --timeout 600
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            // Send email or notifications with build status, logs, and attachments
+            emailext (
+                subject: "Build Status: ${currentBuild.result}",
+                body: "Project: ${env.JOB_NAME}<br/>Build Number: ${env.BUILD_NUMBER}<br/>URL: ${env.BUILD_URL}",
+                to: 'durgamalleshreddy@gmail.com',
+                attachmentsPattern: 'trivyfs.txt, trivyimage.txt'  // Attach vulnerability scan reports
+            )
+        }
+    }
+}
